@@ -1,0 +1,6 @@
+bleak
+pycryptodome
+pillow
+fastapi
+uvicorn
+python-multipart

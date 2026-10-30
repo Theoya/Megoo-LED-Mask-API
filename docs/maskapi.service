@@ -1,0 +1,26 @@
+# Example systemd *user* unit for the mask API on the Jetson. Not installed automatically.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp docs/maskapi.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now maskapi
+#   sudo loginctl enable-linger eligos      # keep it running without a login session
+#   journalctl --user -u maskapi -f
+#
+# BlueZ over D-Bus works for a normal user in the "bluetooth" group (or with the default
+# Ubuntu polkit rules for an active/lingering session).
+
+[Unit]
+Description=Shining Mask LED API (BLE owner)
+After=bluetooth.target network-online.target
+
+[Service]
+WorkingDirectory=%h/LED-Mask
+# --host 0.0.0.0 to reach it over LAN/WireGuard (the API has no auth; the firewall is the guard)
+ExecStart=/usr/bin/python3 -m maskapi serve --host 127.0.0.1 --port 8765 --address 5F:F6:A0:B0:42:F1
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
