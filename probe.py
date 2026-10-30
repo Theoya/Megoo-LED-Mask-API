@@ -79,7 +79,7 @@ def main():
     ap.add_argument("payload", nargs="?")
     ap.add_argument("--bitmap-len", type=int, default=0)
     ap.add_argument("--flag", type=int, default=0)
-    ap.add_argument("--mode", type=int, default=1)
+    ap.add_argument("--mode", type=int, default=None)
     ap.add_argument("--extra-cmd", action="append", help='e.g. "IMAG 5" or "PLAY 1 1"')
     a = ap.parse_args()
     payload = open(a.payload, "rb").read() if a.payload else b""

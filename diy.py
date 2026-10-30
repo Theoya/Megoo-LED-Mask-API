@@ -7,6 +7,7 @@ Pixels are column-major (x outer, y inner), RGB888, no header.
 
   python diy.py show image.png [--slot 1]
   python diy.py anim frame01.png frame02.png ... [--first-slot 1]
+  python diy.py play logo|spiral|session      (or slot numbers: play 2 3 4)
 """
 import argparse
 import asyncio
@@ -59,6 +60,14 @@ class Mask:
     async def __aexit__(self, *exc):
         await self.client.disconnect()
 
+    async def reconnect(self):
+        """Drain stale acks; reconnect only if the link dropped."""
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        await asyncio.sleep(1.5)
+        if not self.client.is_connected:
+            await self.__aenter__()
+
     async def send(self, pkt: bytes):
         await self.client.write_gatt_char(CMD_CHAR, pkt, response=False)
 
@@ -82,8 +91,13 @@ class Mask:
         await self.expect("DATCPOK")
 
     async def play(self, slots):
-        slots = list(slots)[:10]
-        await self.send(raw(len(slots) + 5, "PLAY", len(slots), bytes(slots)))
+        slots = list(slots)[:20]
+        if len(slots) <= 10:
+            await self.send(raw(len(slots) + 5, "PLAY", len(slots), bytes(slots)))
+        else:  # app's long form: length byte 19, first 10 slots, then [n-10][rest]
+            await self.send(raw(19, "PLAY", len(slots), bytes(slots[:10])))
+            await asyncio.sleep(0.1)
+            await self.send(raw(len(slots) - 10, bytes(slots[10:])))
         await self.expect("PLAYOK")
 
     async def delete(self, slots):
@@ -97,7 +111,16 @@ class Mask:
         await self.send(raw(6, "LIGHT", max(1, v)))
 
 
+SHOWS = {"logo": [1], "spiral": list(range(2, 12)), "session": list(range(12, 21))}
+
+
 async def main_async(a):
+    if a.cmd == "play":  # switch between what's already stored, no upload
+        slots = SHOWS.get(a.images[0]) or [int(s) for s in a.images]
+        async with Mask() as m:
+            await m.play(slots)
+        print(f"playing slots {slots}")
+        return
     imgs = [Image.open(p) for p in a.images]
     first = a.slot if a.cmd == "show" else a.first_slot
     slots = list(range(first, first + len(imgs)))
@@ -107,9 +130,17 @@ async def main_async(a):
         except Exception as e:  # empty slots may not ack
             print(f"  (delete: {e!r})")
         for s, img in zip(slots, imgs):
-            t = time.time()
-            await m.upload(s, img)
-            print(f"slot {s} uploaded ({time.time() - t:.1f}s)")
+            for attempt in range(1, 5):
+                t = time.time()
+                try:
+                    await m.upload(s, img)
+                    print(f"slot {s} uploaded ({time.time() - t:.1f}s)", flush=True)
+                    break
+                except Exception as e:
+                    print(f"slot {s} attempt {attempt} failed: {e!r}", flush=True)
+                    if attempt == 4:
+                        raise
+                    await m.reconnect()
         if a.brightness:
             await m.brightness(a.brightness)
         await m.play(slots)
@@ -118,8 +149,8 @@ async def main_async(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["show", "anim"])
-    ap.add_argument("images", nargs="+")
+    ap.add_argument("cmd", choices=["show", "anim", "play"])
+    ap.add_argument("images", nargs="+", help="image files, or for play: a show name (logo/spiral/session) or slot numbers")
     ap.add_argument("--slot", type=int, default=1)
     ap.add_argument("--first-slot", type=int, default=1)
     ap.add_argument("--brightness", type=int, default=0)
