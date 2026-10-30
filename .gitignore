@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+
+# third-party artwork kept local only
+images/virgil*
+# webcam photos and scratch outputs
+*.jpg
+panel_map.json
+panel_map.png

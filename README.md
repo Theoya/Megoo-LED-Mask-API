@@ -1,4 +1,4 @@
-# LED-Mask
+# Megoo-LED-Mask-API
 
 Custom images and animations for a **Megoo LED face mask**, driven from our own code instead
 of the phone app. The mask is a "Shining Mask" clone: a 46 x 58 full-colour LED panel behind
@@ -19,8 +19,9 @@ BLE host and the webcam (`snap.py`, `frame_timer.py`) showing what the mask actu
 | Capability | How | Notes |
 |---|---|---|
 | Full-panel images | `diy.py show`, `python3 -m maskapi diy`, `POST /diy` | 46 x 58, per-pixel RGB. The panel is an oval: the grid corners have no LEDs. |
-| 20 on-mask DIY slots | upload, `PLAY`, `DELE` | Uploads take ~4-5 s per frame. `diy.py` retries/reconnects per frame. |
-| Slot animations | `PLAY` of up to 20 slots | The >10 form (length byte 19 + continuation packet `[n-10][slots]`) works; the mask answered `PLAYOK`. The mask cycles about **1 frame/second** and cannot crossfade. |
+| 20 on-mask DIY slots | upload, `PLAY`, `DELE` | Uploads take ~4-8 s per frame and the link sometimes drops. `diy.py` and `maskapi` retry each frame (4 tries: drain acks, wait 1.5 s, reconnect only if dropped). `DELE` before upload answers `DELEOK`. |
+| Slot animations | `PLAY` of up to 20 slots (`diy.py`, `maskapi play`) | The >10 form (length byte 19 + continuation packet `[n-10][slots]`) works; the mask answered `PLAYOK`. The mask cycles about **1 frame/second** and cannot crossfade. |
+| Gesture / hand-wave sensor | `FACE`, `maskapi gesture shows` | `0c FACE 01 00 02 04 01 02 0c 0b` -> `FACEOK` cycles DIY slots 1, 2, 12, 11. Each slot shows as a **still** (animations don't animate via the gesture), and the mask sends no notification on a wave. Off: `08 FACE 00 00 02 00`, no reply. |
 | Playback speed | `SPEED` | Only slows slot playback: `SPEED 1` is ~3.5 s/frame, 10-255 are all ~1.0 s/frame. So ~1 fps is the ceiling; smoothness has to come from small steps and motion blur baked into the frames (the `spiral20` set, see [Animations](#animations)). |
 | Built-in full-face image | `IMAG` | One test worked with plaintext `06 'IMAG' 01 00`. The app source says `05 'IMAG' idx`; both noted until it's pinned down. |
 | Scrolling text (16-row band) | `python3 -m maskapi text "HELLO CLAUDE" --color ff4600` | Also the first real-device run of `maskapi`: connect, upload and scroll all worked. Options `--rainbow`, `--mode 1/3/4`, `--speed`, `--preview`. |
@@ -28,12 +29,21 @@ BLE host and the webcam (`snap.py`, `frame_timer.py`) showing what the mask actu
 | Brightness | `LIGHT` | |
 | Generators | see [Files](#files) | Starburst logo (`starburst.py`, `make_icon.py`); full-panel logo `images/logo_full.png`; red oval spiral (`spiral.py`; `images/spiral`, smoothed `images/spiral20`); creepy tendril logo (`tendrils.py`; rendered, **not yet played** on the mask); scrolling terminal animation of a Claude Code session (`claude_session.py`, being added). |
 | Webcam verification | `snap.py`, `frame_timer.py` | Photographs the mask; measures the playback interval. |
+| Panel / eye-hole map | `map_panel.py`, `find_eyes.py` -> `eyes.json` | The oval and both eye holes in grid cells (image-left x5-17 y14-22, image-right x28-40 y14-20). |
+
+### Built on top, tested against the fake mask only
+
+- **Shows**: named slot lists in a JSON registry (default: logo 1, spiral 2-10, virgil 11,
+  session 12-20); `maskapi define-show / play-show / next / gesture shows`, `POST /shows/{name}`,
+  `/next`. Overlapping slot ranges are refused unless forced.
+- **Eye-safe placement**: `maskapi place in.png out.png`, `diy --avoid-eyes`, `?avoid_eyes=true`.
+  Scales an image as large as it can go while keeping light off the eye holes and outside the oval.
+- **Streaming** (`/ws`): latest-wins slot/show switching, rhythm bars, full-panel frames and
+  16-row band frames, with stats. Rates still to be measured (`examples/stream_demo.py`).
 
 ### Decoded from the official app, not yet tested on the mask
 
-- **Gesture / hand-wave sensor** (`FACE`): cycle built-in or DIY slots, in order or at random
-  (`maskapi gesture`, `POST /gesture`).
-- **Music/rhythm mode**: stream 24 EQ bars to char `...960b` every ~120 ms (`POST /rhythm`).
+- **Music/rhythm mode**: stream 24 EQ bars to char `...960b` every ~120 ms (`POST /rhythm`, `/ws`).
 - Text foreground/background colours (`FC`/`BC`/`M`), `ANIM`/`LOOA` built-in animations,
   `CHEC` slot count, `TIME` sync.
 
@@ -218,9 +228,9 @@ python3 tendrils.py images/claude_symbol_source.webp images/tendrils --frames 10
 python3 diy.py anim images/tendrils/frame*.png --first-slot 2
 ```
 
-**Replaying stored slots** without re-uploading: `python3 -m maskapi play 1 2 3`. The
-library/CLI/API `play` takes up to 10 slots; for 11-20 use `diy.py anim`, which sends the
-long form. `python3 -m maskapi speed 1` slows playback to ~3.5 s/frame.
+**Replaying stored slots** without re-uploading: `python3 -m maskapi play 1 2 3` (1-20
+slots; above 10 it sends the long form), or by show name: `python3 -m maskapi play-show spiral`,
+`python3 -m maskapi next`. `python3 -m maskapi speed 1` slows playback to ~3.5 s/frame.
 
 **Checking it**: `python3 snap.py out.jpg [--crop x0,y0,x1,y1] [--scale 0.6]` takes a webcam
 photo of the mask, and `python3 frame_timer.py 10` watches for 10 s and prints the median
@@ -243,15 +253,23 @@ interval between frame changes. Both run on the PC with the webcam (OpenCV).
 | `snap.py` | Webcam photo of the mask, for checking results |
 | `frame_timer.py` | Webcam measurement of the mask's frame interval |
 | `ble_scan.py` | Lists nearby BLE devices |
+| `listen.py` | Listens for notifications (used to check what a hand wave sends) |
+| `map_panel.py` | Test pattern + webcam analysis of which grid cells have visible LEDs (`panel_map.json`) |
+| `find_eyes.py` | Finds the eye holes from a webcam photo -> `eyes.json`, `eyes_check.png` |
+| `eyes.json` | Measured eye-hole cells, used by `maskapi` placement (a copy ships in `maskapi/`) |
 | `requirements.txt` | Python dependencies |
 | `maskapi/__main__.py` | CLI, `python3 -m maskapi ...` ([docs/API.md](docs/API.md)) |
-| `maskapi/server.py` | FastAPI HTTP server that owns the BLE link (`serve`) |
-| `maskapi/client.py` | `Mask` async library: one lock, reconnect and retry |
-| `maskapi/protocol.py` | Packet layouts and AES, no I/O |
+| `maskapi/server.py` | FastAPI HTTP + WebSocket server that owns the BLE link (`serve`) |
+| `maskapi/client.py` | `Mask` async library: one lock, per-frame retry, shows |
+| `maskapi/shows.py` | Shows registry (named slot lists, cycle order, current show) |
+| `maskapi/panel.py` | Oval + eye-hole map and eye-safe `place()` |
+| `maskapi/stream.py` | `Streamer`: latest-wins lanes behind `/ws` |
+| `maskapi/protocol.py` | Packet layouts (incl. long `PLAY`) and AES, no I/O |
 | `maskapi/image.py` | Panel/text encoding, text rendering, frame loading, previews |
 | `maskapi/transport.py` | bleak BLE transport and scan |
 | `maskapi/fake.py` | In-memory fake mask for the tests and `--fake` |
-| `tests/` | pytest suite (`test_protocol`, `test_image`, `test_client`, `test_api`), runs against the fake mask |
+| `examples/stream_demo.py` | `/ws` client demo (`--fake` runs without BLE) |
+| `tests/` | pytest suite (protocol, image, panel, shows, stream, client, api), runs against the fake mask |
 | `docs/API.md` | Library, CLI and HTTP API reference |
 | `docs/maskapi.service` | Example systemd user unit for the API on the Jetson |
 | `images/` | Source logo, rendered images, animation frames (`spiral`, `spiral_sub`, `spiral20`, `tendrils`), calibration grid |

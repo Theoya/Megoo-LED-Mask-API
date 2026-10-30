@@ -4,9 +4,12 @@
         await m.upload_diy("face.png", slot=1)      # full 46x58 panel, shown at once
         await m.show_text("HELLO", "00ff00")        # 16-row text path
         await m.set_brightness(40)
+        await m.next_show()                         # shows registry (maskapi.shows)
 
 Every public method takes the lock, connects if needed, and on TransportError or an
-ack timeout drops the link, reconnects and retries the whole operation.
+ack timeout retries the whole operation with the recipe verified on the mask: drain
+stale acks, wait 1.5 s, reconnect only if the link actually dropped (4 attempts).
+Multi-frame uploads retry per frame.
 """
 from __future__ import annotations
 
@@ -14,15 +17,17 @@ import asyncio
 import collections
 import logging
 import time
-from typing import Awaitable, Callable, Optional, Sequence, TypeVar
+from typing import Awaitable, Callable, List, Optional, Sequence, TypeVar
 
 from . import protocol as P
-from .image import (MASK_WIDTH, Frame, ImageSource, Panel, encode_image, encode_panel, encode_pixels,
-                    load_frames, parse_color, render_text)
+from .image import (MASK_WIDTH, Frame, ImageSource, Panel, collect_frames, encode_image, encode_panel,
+                    encode_pixels, load_frames, parse_color, render_text)
+from .shows import ShowRegistry
 from .transport import BleakTransport, Transport, TransportError
 
 log = logging.getLogger("maskapi")
 T = TypeVar("T")
+Progress = Optional[Callable[[int, int], None]]
 
 
 class MaskError(Exception):
@@ -30,18 +35,25 @@ class MaskError(Exception):
 
 
 class AckTimeout(MaskError):
-    """Expected notification never came (retried after reconnect)."""
+    """Expected notification never came (retried)."""
 
 
 class Mask:
     def __init__(self, transport: Optional[Transport] = None, address: Optional[str] = None,
-                 retries: int = 3, ack_timeout: float = 5.0, gap: float = 0.05,
-                 idle_disconnect: float = 0.0):
+                 retries: int = 4, ack_timeout: float = 5.0, gap: float = 0.05,
+                 idle_disconnect: float = 0.0, retry_wait: float = 1.5, play_gap: float = 0.1,
+                 shows=None, panel_map=None):
+        """shows: a ShowRegistry or a path to its JSON (default ~/.maskapi/shows.json, lazily).
+        panel_map: a maskapi.panel.PanelMap for avoid_eyes (default: eyes.json)."""
         self.transport = transport or BleakTransport(address)
         self.retries = retries
         self.ack_timeout = ack_timeout
         self.gap = gap
+        self.retry_wait = retry_wait
+        self.play_gap = play_gap  # pause between the two packets of a long PLAY
         self.idle_disconnect = idle_disconnect
+        self._shows = shows if shows is None or isinstance(shows, ShowRegistry) else ShowRegistry(shows)
+        self.panel_map = panel_map
         self.notifications = collections.deque(maxlen=50)  # (time, text)
         self.sent = collections.deque(maxlen=50)  # (time, description)
         self.state = {}  # last values we set: brightness, mode, slots, ...
@@ -61,10 +73,17 @@ class Mask:
     def connected(self) -> bool:
         return self.transport.is_connected
 
+    @property
+    def shows(self) -> ShowRegistry:
+        if self._shows is None:
+            self._shows = ShowRegistry()
+        return self._shows
+
     def status(self) -> dict:
         t = self.transport
         return {
             "connected": self.connected, "name": t.name, "address": t.address, "rssi": t.rssi,
+            "show": self._shows.current if self._shows else None,
             "state": dict(self.state), "last_error": self.last_error,
             "notifications": [n for _, n in list(self.notifications)[-10:]],
             "sent": [s for _, s in list(self.sent)[-10:]],
@@ -95,13 +114,15 @@ class Mask:
         async with self._lock:
             await self.transport.disconnect()
 
-    async def _run(self, op: Callable[[], Awaitable[T]]) -> T:
-        """Run op under the lock with connect + retry-on-link-failure."""
+    async def _run(self, op: Callable[[], Awaitable[T]], retries: Optional[int] = None) -> T:
+        """Run op under the lock with connect + retry. On a link failure or missing ack:
+        drain the notify queue, wait retry_wait, reconnect only if disconnected, retry."""
+        retries = retries or self.retries
         async with self._lock:
             if self._idle_task:
                 self._idle_task.cancel()
             try:
-                for attempt in range(1, self.retries + 1):
+                for attempt in range(1, retries + 1):
                     try:
                         await self._ensure()
                         result = await op()
@@ -109,11 +130,12 @@ class Mask:
                         return result
                     except (TransportError, AckTimeout) as e:
                         self.last_error = f"{type(e).__name__}: {e}"
-                        log.warning("attempt %d/%d failed: %s", attempt, self.retries, self.last_error)
-                        await self.transport.disconnect()
-                        if attempt == self.retries:
+                        log.warning("attempt %d/%d failed: %s", attempt, retries, self.last_error)
+                        if attempt == retries:
                             raise
-                        await asyncio.sleep(1)
+                        self._drain()
+                        await asyncio.sleep(self.retry_wait)
+                        self._drain()
                     except MaskError as e:
                         self.last_error = f"{type(e).__name__}: {e}"
                         raise
@@ -257,11 +279,19 @@ class Mask:
 
     # ---- full-panel DIY slots ------------------------------------------------------
 
+    def _panel(self, src, fit="contain", avoid_eyes=False, margin=1, valign="center") -> Panel:
+        return encode_panel(src, fit, avoid_eyes, margin, valign, self.panel_map)
+
     async def upload_diy(self, src, slot: int = 1, fit: str = "contain", play: bool = True,
-                         timestamp: Optional[int] = None) -> Panel:
-        """Upload a 46x58 RGB image (path/bytes/PIL/Panel) into DIY slot 1-20, optionally show it."""
-        panel = src if isinstance(src, Panel) else encode_panel(src, fit)
+                         timestamp: Optional[int] = None, avoid_eyes: bool = False, margin: int = 1,
+                         valign: str = "center", delete_first: bool = True) -> Panel:
+        """Upload a 46x58 RGB image (path/bytes/PIL/Panel) into DIY slot 1-20, optionally show it.
+        avoid_eyes places it with maskapi.panel.place. delete_first sends DELE first
+        (one attempt, failure ignored), as diy.py does."""
+        panel = self._panel(src, fit, avoid_eyes, margin, valign)
         P.check_slot(slot)
+        if delete_first:
+            await self.delete_slots([slot], ignore_errors=True)
         payload = panel.payload
 
         async def op():
@@ -277,9 +307,12 @@ class Mask:
         return panel
 
     async def upload_animation(self, frames, start_slot: int = 1, fit: str = "contain",
-                               play: bool = True, max_frames: int = P.MAX_PER_PACKET) -> list:
-        """Upload frames (list of images, or one animated GIF) to consecutive slots and PLAY
-        them together so the mask cycles through them. Returns the slots used."""
+                               play: bool = True, max_frames: int = P.MAX_PLAY, avoid_eyes: bool = False,
+                               margin: int = 1, valign: str = "center", delete_first: bool = True,
+                               progress: Progress = None) -> list:
+        """Upload frames (list of images, or one animated GIF, subsampled to max_frames) to
+        consecutive slots, each frame with its own retries, then PLAY them together so the
+        mask cycles through them (~1 frame/s). Returns the slots used."""
         if not isinstance(frames, (list, tuple)):
             frames = load_frames(frames, max_frames)
         if not frames:
@@ -287,30 +320,42 @@ class Mask:
         if len(frames) > max_frames:
             raise ValueError(f"at most {max_frames} frames")
         slots = list(range(start_slot, start_slot + len(frames)))
+        P.check_slot(start_slot)
         P.check_slot(slots[-1])
-        for f, slot in zip(frames, slots):
-            await self.upload_diy(f, slot, fit, play=False)
+        panels = [self._panel(f, fit, avoid_eyes, margin, valign) for f in frames]
+        if delete_first:
+            await self.delete_slots(slots, ignore_errors=True)
+        for i, (p, slot) in enumerate(zip(panels, slots)):
+            await self.upload_diy(p, slot, play=False, delete_first=False)
+            if progress:
+                progress(i + 1, len(slots))
         if play:
             await self.play_slots(slots)
         return slots
 
-    async def _play(self, slots: Sequence[int]):
+    async def _play(self, slots: Sequence[int], wait_ack: bool = True):
         self._drain()
-        await self._write_plain(P.play(slots))
-        await self._expect("PLAYOK")
+        for i, pkt in enumerate(P.play_packets(slots)):
+            if i:
+                await asyncio.sleep(self.play_gap)
+            await self._write_plain(pkt)
+        if wait_ack:
+            await self._expect("PLAYOK")
 
     async def play_slots(self, slots: Sequence[int]):
-        """PLAY n slots...: one slot shows it, several make the mask cycle them (<=10)."""
+        """PLAY 1-20 slots: one slot shows it, several make the mask cycle them (~1 s/frame).
+        More than 10 uses the long two-packet form."""
         slots = list(slots)
-        P.play(slots)  # validate before connecting
+        P.play_packets(slots)  # validate before connecting
         await self._run(lambda: self._play(slots))
         self.state.update(showing="diy", slots=slots)
 
     async def play_diy_slot(self, slot: int):
         await self.play_slots([slot])
 
-    async def delete_slots(self, slots: Sequence[int]):
-        """DELE in packets of up to 10 slots, each acked DELEOK."""
+    async def delete_slots(self, slots: Sequence[int], ignore_errors: bool = False):
+        """DELE in packets of up to 10 slots, each acked DELEOK. ignore_errors: a single
+        attempt, any failure logged and swallowed (used before uploads)."""
         slots = [P.check_slot(s) for s in slots]
         groups = [slots[i : i + P.MAX_PER_PACKET] for i in range(0, len(slots), P.MAX_PER_PACKET)]
 
@@ -319,7 +364,13 @@ class Mask:
                 self._drain()
                 await self._write_plain(P.dele(g))
                 await self._expect("DELEOK")
-        await self._run(op)
+        try:
+            await self._run(op, retries=1 if ignore_errors else None)
+        except (TransportError, MaskError) as e:
+            if not ignore_errors:
+                raise
+            log.info("DELE %s failed (ignored): %s", slots, e)
+            return
         if "diy_uploaded" in self.state:
             self.state["diy_uploaded"] = [s for s in self.state["diy_uploaded"] if s not in slots]
 
@@ -336,6 +387,48 @@ class Mask:
         self.state["diy_count"] = count
         return count
 
+    # ---- shows -----------------------------------------------------------------------
+
+    def list_shows(self) -> dict:
+        return self.shows.to_json()
+
+    async def define_show(self, name: str, frames, start_slot: Optional[int] = None, fit: str = "contain",
+                          avoid_eyes: bool = False, margin: int = 1, valign: str = "center",
+                          play: bool = True, force: bool = False, delete_first: bool = True,
+                          progress: Progress = None) -> dict:
+        """Upload frames (images, GIFs, frame dirs; <=20) to consecutive slots and record
+        them as show `name`. start_slot None: the show's current slots, else the first free
+        run. Overlapping another show raises ShowError unless force (that show is dropped)."""
+        frames = collect_frames(frames, P.MAX_PLAY)
+        slots = self.shows.plan(name, len(frames), start_slot, force)
+        await self.upload_animation(frames, slots[0], fit, play=False, avoid_eyes=avoid_eyes, margin=margin,
+                                    valign=valign, delete_first=delete_first, progress=progress)
+        dropped = self.shows.define(name, slots, force=force, frames=len(frames), avoid_eyes=avoid_eyes)
+        if play:
+            await self.play_show(name)
+        return {"name": name, "slots": slots, "dropped": dropped}
+
+    async def play_show(self, name: str) -> List[int]:
+        slots = self.shows.slots(name)
+        await self.play_slots(slots)
+        self.shows.set_current(name)
+        self.state["show"] = name
+        return slots
+
+    async def next_show(self) -> str:
+        """Play the show after the current one in the registry order (like a hand wave,
+        but animations keep animating). Persists the new current show."""
+        name = self.shows.next_name()
+        await self.play_show(name)
+        return name
+
+    async def gesture_our_shows(self, loop_random: bool = False) -> List[int]:
+        """FACE in DIY mode over the first slot of each show, in cycle order. The gesture
+        shows each slot as a still; animations don't animate this way."""
+        ids = self.shows.gesture_ids()
+        await self.set_gesture(True, loop_random, P.SELECT_DIY, ids)
+        return ids
+
     # ---- built-ins, settings, gesture, rhythm ------------------------------------------
 
     async def _simple(self, key: str, value, name: str, *args: P.Arg, expect: Optional[str] = None):
@@ -350,10 +443,11 @@ class Mask:
         await self._simple("mode", mode, "MODE", mode)
 
     async def set_speed(self, speed: int):
+        """SPEED v: only slows slot playback (1 ~3.5 s/frame; 10-255 ~1.0 s/frame)."""
         await self._simple("speed", speed, "SPEED", speed)
 
     async def show_builtin_image(self, idx: int, *extra: int):
-        """IMAG idx (0-based)."""
+        """IMAG idx [extra...]. `06 IMAG 01 00` (idx 1, extra 0) worked on the mask."""
         await self._simple("builtin_image", idx, "IMAG", idx, *extra)
         self.state["showing"] = "builtin_image"
 
@@ -379,9 +473,10 @@ class Mask:
 
     async def set_gesture(self, enable: bool, loop_random: bool = False, select: int = P.SELECT_ALL,
                           ids: Sequence[int] = ()):
-        """FACE: hand-wave sensor cycles images. select 0 all, 1 built-in ids, 2 DIY slots."""
+        """FACE: hand-wave sensor cycles images. select 0 all, 1 built-in ids, 2 DIY slots.
+        Enabling is acked FACEOK (verified); disabling got no reply, so it isn't awaited."""
         plain = P.face(enable, loop_random, select, ids)
-        await self.send_raw(plain, expect="FACEOK")
+        await self.send_raw(plain, expect="FACEOK" if enable else None)
         self.state["gesture"] = {"enable": bool(enable), "random": bool(loop_random),
                                  "select": select, "ids": list(ids) if select else []}
 
@@ -389,3 +484,12 @@ class Mask:
         """One mic/rhythm frame (24 bars, 0-9) to the music char; stream every ~120 ms."""
         plain = P.rhythm(mode, bars)
         await self._run(lambda: self.transport.write(P.MUSIC_CHAR, P.encrypt(plain)))
+
+    # ---- fast paths for streaming (no ack wait) --------------------------------------
+
+    async def play_nowait(self, slots: Sequence[int]):
+        """PLAY without waiting for PLAYOK (streaming fast path). A link failure still raises."""
+        slots = list(slots)
+        P.play_packets(slots)
+        await self._run(lambda: self._play(slots, wait_ack=False), retries=1)
+        self.state.update(showing="diy", slots=slots)

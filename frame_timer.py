@@ -23,3 +23,7 @@ cap.release()
 events = hits[:1] + [b for a, b in zip(hits, hits[1:]) if b - a > 0.15]
 gaps = np.diff(events) if len(events) > 1 else []
 print(f"camera {n / secs:.1f} fps, {len(events)} changes, median interval {np.median(gaps):.2f}s" if len(gaps) else f"camera {n / secs:.1f} fps, too few changes")
+if len(gaps):
+    hist, edges = np.histogram(gaps, bins=[0, 0.15, 0.25, 0.35, 0.5, 0.75, 1.1, 2, 99])
+    print("interval histogram:", {f"{a:.2f}-{b:.2f}s": int(h) for a, b, h in zip(edges, edges[1:], hist) if h})
+    print("change times:", [round(t, 1) for t in events])

@@ -89,15 +89,65 @@ def frame(k, top, bottom, x0):
     return img
 
 
+TINY_SESSION = [  # longer transcript for --tiny (anti-aliased TrueType text, ~3px tall)
+    ("> fix the bug", GREY),
+    ("* Read mask.py", ORANGE),
+    ("* Edit diy.py", GREEN),
+    ("  +12 -3", GREEN),
+    ("* Bash pytest", BLUE),
+    ("  42 passed", GREEN),
+    ("* Update README", GREEN),
+    ("* Done", ORANGE),
+    ("", GREY),
+]
+
+
+def tiny_frame(k, top, bottom, x0, font_path, px, lh, header=True):
+    """Like frame(), but text is drawn with a real font at 8x and box-downsampled."""
+    from PIL import ImageDraw, ImageFont
+
+    ss = 8
+    font = ImageFont.truetype(font_path, px * ss * 1.35)
+    big = Image.new("RGB", (W * ss, H * ss))
+    d = ImageDraw.Draw(big)
+    n = len(TINY_SESSION)
+    first = top - k * lh
+    for rep in range(-1, 3):
+        for i, (text, color) in enumerate(TINY_SESSION):
+            y = first + (rep * n + i) * lh
+            if top - lh < y < bottom:
+                d.text((x0 * ss, y * ss), text, font=font, fill=color)
+    img = big.resize((W, H), Image.BOX)
+    pxs = img.load()
+    for y in range(H):
+        for x in range(W):
+            if not (top <= y < bottom) or not in_oval(x, y):
+                pxs[x, y] = (0, 0, 0)
+    if header:
+        draw_text(pxs, 15, 4, [("* ", ORANGE), ("CC", ORANGE)])
+    for x in range(8, 38):
+        pxs[x, bottom + 1] = GREY
+    draw_text(pxs, 11, bottom + 3, [("> ", WHITE), ("_" if k % 2 == 0 else " ", ORANGE)])
+    return img
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("outdir")
     ap.add_argument("--top", type=int, default=11)
     ap.add_argument("--bottom", type=int, default=47)
     ap.add_argument("--x", type=int, default=6)
+    ap.add_argument("--tiny", action="store_true", help="half-size anti-aliased text, more lines")
+    ap.add_argument("--font", default=r"C:\Windows\Fonts\arialbd.ttf")
+    ap.add_argument("--px", type=int, default=4, help="--tiny text height in LEDs")
+    ap.add_argument("--no-header", action="store_true", help="drop the '* CC' header and scroll from the top")
     a = ap.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
-    frames = [frame(k, a.top, a.bottom, a.x) for k in range(len(SESSION))]
+    if a.tiny:
+        top = 4 if a.no_header else a.top
+        frames = [tiny_frame(k, top, a.bottom, 4, a.font, a.px, a.px + 1, not a.no_header) for k in range(len(TINY_SESSION))]
+    else:
+        frames = [frame(k, a.top, a.bottom, a.x) for k in range(len(SESSION))]
     for i, f in enumerate(frames):
         f.save(os.path.join(a.outdir, f"frame{i + 1:02d}.png"))
     sheet = Image.new("RGB", (W * 4 * len(frames), H * 4))

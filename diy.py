@@ -1,4 +1,4 @@
-"""Full-panel (46x58, per-pixel RGB) DIY images and slot animations.
+﻿"""Full-panel (46x58, per-pixel RGB) DIY images and slot animations.
 
 Format from the official app (cn.com.heaton.shiningmask 1.2.3):
   DATS 09 'DATS' [u16 BE len] 00 [slot] 01 -> DATSOK, chunks -> REOK each,
@@ -11,6 +11,7 @@ Pixels are column-major (x outer, y inner), RGB888, no header.
 """
 import argparse
 import asyncio
+import os
 import sys
 import time
 
@@ -111,12 +112,25 @@ class Mask:
         await self.send(raw(6, "LIGHT", max(1, v)))
 
 
-SHOWS = {"logo": [1], "spiral": list(range(2, 12)), "session": list(range(12, 21))}
+SHOWS = {"logo": [1], "spiral": list(range(2, 11)), "virgil": [11], "session": list(range(12, 21))}
+
+
+CYCLE = ["logo", "spiral", "session", "virgil"]  # same order as the wave sensor
+STATE = os.path.expanduser("~/.mask_show")
 
 
 async def main_async(a):
+    if a.cmd == "next":  # like a hand wave, but animations keep playing
+        try:
+            cur = open(STATE).read().strip()
+        except OSError:
+            cur = CYCLE[-1]
+        a.images = [CYCLE[(CYCLE.index(cur) + 1) % len(CYCLE)] if cur in CYCLE else CYCLE[0]]
+        a.cmd = "play"
     if a.cmd == "play":  # switch between what's already stored, no upload
         slots = SHOWS.get(a.images[0]) or [int(s) for s in a.images]
+        if a.images[0] in SHOWS:
+            open(STATE, "w").write(a.images[0])
         async with Mask() as m:
             await m.play(slots)
         print(f"playing slots {slots}")
@@ -149,8 +163,8 @@ async def main_async(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["show", "anim", "play"])
-    ap.add_argument("images", nargs="+", help="image files, or for play: a show name (logo/spiral/session) or slot numbers")
+    ap.add_argument("cmd", choices=["show", "anim", "play", "next"])
+    ap.add_argument("images", nargs="*", help="image files, or for play: a show name (logo/spiral/session) or slot numbers")
     ap.add_argument("--slot", type=int, default=1)
     ap.add_argument("--first-slot", type=int, default=1)
     ap.add_argument("--brightness", type=int, default=0)

@@ -76,6 +76,24 @@ def test_play_dele():
         P.dele([0])
 
 
+def test_play_long_form():
+    assert P.play_packets([3]) == [P.play([3])]
+    a, b = P.play_packets(list(range(1, 21)))
+    assert a == bytes([19]) + b"PLAY" + bytes([20]) + bytes(range(1, 11))  # exactly 16 bytes
+    assert b == P.pad(bytes([10]) + bytes(range(11, 21)))
+    a, b = P.play_packets(list(range(1, 12)))
+    assert a[5] == 11 and b[:2] == bytes([1, 11])
+    with pytest.raises(ValueError):
+        P.play_packets(list(range(1, 21)) + [1])
+    with pytest.raises(ValueError):
+        P.play_packets([21])
+
+
+def test_face_verified_layouts():
+    assert P.face(True, False, P.SELECT_DIY, [1, 2, 12, 11])[:13] == bytes.fromhex("0c46414345010002040102") + bytes([12, 11])
+    assert P.face(False, False, P.SELECT_DIY, [])[:9] == bytes.fromhex("08464143450000") + bytes([2, 0])
+
+
 def test_face():
     assert P.face(False, False, 0)[:9] == b"\x08FACE\x00\x00\x00\x00"
     assert P.face(True, True, P.SELECT_ALL, [1, 2])[:9] == b"\x08FACE\x01\x01\x00\x00"

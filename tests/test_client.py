@@ -14,7 +14,7 @@ def run(coro):
 
 
 def mask(**kw):
-    return Mask(FakeTransport(**kw), gap=0, ack_timeout=0.5)
+    return Mask(FakeTransport(**kw), gap=0, ack_timeout=0.5, retry_wait=0, play_gap=0)
 
 
 def test_text_upload_flow():
@@ -57,7 +57,7 @@ def test_animation_and_play():
         assert slots == [5, 6, 7] and sorted(m.transport.slots) == [5, 6, 7]
         assert m.transport.playing == [5, 6, 7]
         with pytest.raises(ValueError):
-            await m.upload_animation(frames * 4)
+            await m.upload_animation(frames * 7)  # 21 > 20
         with pytest.raises(ValueError):
             await m.upload_animation(frames, start_slot=19)
     run(go())
@@ -107,7 +107,7 @@ def test_gives_up_after_retries():
         m = mask(fail_connects=10)
         with pytest.raises(Exception):
             await m.set_brightness(10)
-        assert m.transport.connects == 3 and "fake connect failure" in m.last_error
+        assert m.transport.connects == 4 and "fake connect failure" in m.last_error
     run(go())
 
 
@@ -117,7 +117,8 @@ def test_ack_timeout_and_error():
         m.retries = 2
         with pytest.raises(AckTimeout):
             await m.play_slots([1])
-        assert m.transport.connects == 2
+        # still connected, so no reconnect; both attempts re-sent PLAY
+        assert m.transport.connects == 1 and m.transport.names().count("PLAY") == 2
         m = mask(error_on="DATCP")
         with pytest.raises(MaskError):
             await m.upload_diy(Image.new("RGB", (1, 1)), 2)

@@ -24,7 +24,9 @@ CHUNK = 98
 BLOCK = 16
 PANEL_W, PANEL_H = 46, 58
 DIY_SLOTS = range(1, 21)
-MAX_PER_PACKET = 10  # slots per PLAY / DELE packet
+MAX_PER_PACKET = 10  # slots per short PLAY / DELE packet
+MAX_PLAY = 20  # long PLAY form: 19 'PLAY' n + 10 slots, then [n-10] + the rest
+PLAY_LONG_LEN = 19  # length byte of the long form's first packet (verified on the mask)
 FACE_MAX_IDS = 7  # 15-byte body limit: 'FACE' + 4 header bytes + ids
 
 # MODE values (from mask-go; 1 and 3 verified)
@@ -158,7 +160,22 @@ def slot_list(name: str, slots: Sequence[int]) -> bytes:
 
 
 def play(slots: Sequence[int]) -> bytes:
+    """Short PLAY (1-10 slots). Use play_packets for up to 20."""
     return slot_list("PLAY", slots)
+
+
+def play_packets(slots: Sequence[int]) -> list:
+    """PLAY plaintext blocks for 1-20 slots (verified on the mask, which answers PLAYOK).
+    <=10: one block [n+5] 'PLAY' n slots. >10: [19] 'PLAY' n [first 10 slots], then a
+    second block [n-10] [remaining slots], sent ~0.1 s later."""
+    slots = [check_slot(s) for s in slots]
+    if not 1 <= len(slots) <= MAX_PLAY:
+        raise ValueError(f"PLAY takes 1-{MAX_PLAY} slots, got {len(slots)}")
+    if len(slots) <= MAX_PER_PACKET:
+        return [play(slots)]
+    n = len(slots)
+    first = bytes([PLAY_LONG_LEN]) + b"PLAY" + bytes([n]) + bytes(slots[:MAX_PER_PACKET])
+    return [first, pad(bytes([n - MAX_PER_PACKET]) + bytes(slots[MAX_PER_PACKET:]))]
 
 
 def dele(slots: Sequence[int]) -> bytes:
@@ -167,7 +184,8 @@ def dele(slots: Sequence[int]) -> bytes:
 
 def face(enable: bool, loop_random: bool = False, select: int = SELECT_ALL,
          ids: Sequence[int] = ()) -> bytes:
-    """Gesture sensor config: FACE enable loop select count ids..."""
+    """Gesture sensor config: FACE enable loop select count ids...
+    Verified: 0c FACE 01 00 02 04 01 02 0c 0b -> FACEOK; off: 08 FACE 00 00 02 00 (no reply)."""
     if select not in (SELECT_ALL, SELECT_BUILTIN, SELECT_DIY):
         raise ValueError("select must be 0 (all), 1 (built-in) or 2 (DIY)")
     ids = [] if select == SELECT_ALL else list(ids)

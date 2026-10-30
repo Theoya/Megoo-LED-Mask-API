@@ -1,7 +1,7 @@
 """In-memory fake mask for tests and `serve --fake`. No Bluetooth involved.
 
 Decrypts command writes and acks like the real mask (DATSOK / REOK / DATCPOK,
-PLAYOK, DELEOK, FACEOK, CHEC+count), keeping DIY slots in a dict.
+PLAYOK incl. the long 2-packet PLAY, DELEOK, FACEOK, CHEC+count), keeping DIY slots in a dict.
 fail_connects / fail_writes inject TransportErrors; error_on makes a command reply ERROR.
 """
 from __future__ import annotations
@@ -38,6 +38,7 @@ class FakeTransport(Transport):
         self.completed = []  # payloads finished with DATCP
         self.slots = {}  # DIY slot -> payload
         self.playing = []
+        self._play_pending = None  # (n, first 10 slots) after a long-form PLAY
         self._connected = False
         self._notify = None
 
@@ -81,6 +82,14 @@ class FakeTransport(Transport):
 
     def _command(self, plain):
         self.commands.append(plain)
+        if self._play_pending:  # second packet of a long PLAY: [n-10] slots...
+            n, first = self._play_pending
+            self._play_pending = None
+            rest = list(plain[1 : 1 + plain[0]])
+            if len(first) + len(rest) == n:
+                self.playing = first + rest
+                return self._reply("PLAYOK")
+            return self._reply("ERROR")
         body = plain[1 : 1 + plain[0]]
         name = P.describe(plain).split()[0]
         if self.error_on and body.startswith(self.error_on.encode()):
@@ -99,8 +108,13 @@ class FakeTransport(Transport):
         elif body.startswith(b"CHEC"):
             self._reply(b"CHEC" + bytes([len(self.slots)]))
         elif body.startswith(b"PLAY"):
+            if plain[0] == P.PLAY_LONG_LEN and body[4] > P.MAX_PER_PACKET:
+                self._play_pending = (body[4], list(plain[6:16]))
+                return
             self.playing = list(body[5 : 5 + body[4]])
             self._reply("PLAYOK")
+        elif body.startswith(b"FACE") and not body[4]:
+            pass  # the real mask sent nothing for FACE off
         elif body.startswith(b"DELE"):
             for s in body[5 : 5 + body[4]]:
                 self.slots.pop(s, None)

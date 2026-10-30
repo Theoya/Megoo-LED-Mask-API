@@ -13,9 +13,10 @@ from maskapi.server import create_app
 
 
 @pytest.fixture
-def api():
+def api(tmp_path):
     fake = FakeTransport()
-    with TestClient(create_app(Mask(fake, gap=0, ack_timeout=0.5))) as c:
+    with TestClient(create_app(Mask(fake, gap=0, ack_timeout=0.5, retry_wait=0, play_gap=0,
+                                    shows=tmp_path / "shows.json"))) as c:
         c.fake = fake
         yield c
 
@@ -97,7 +98,9 @@ def test_diy_play_delete_count(api):
     assert api.post("/diy/2/play").status_code == 200 and api.fake.playing == [2]
     assert api.request("DELETE", "/diy", json={"slots": [1]}).status_code == 200
     assert api.get("/diy/count").json()["count"] == 1
-    assert api.post("/diy/play", json={"slots": list(range(1, 12))}).status_code == 400
+    assert api.post("/diy/play", json={"slots": list(range(1, 12))}).status_code == 200  # long PLAY
+    assert api.fake.playing == list(range(1, 12))
+    assert api.post("/diy/play", json={"slots": list(range(1, 22))}).status_code == 422
     assert api.post("/diy/play", json={"slots": []}).status_code == 422
 
 
@@ -134,7 +137,7 @@ def test_builtins_and_settings(api):
 def test_gesture(api):
     assert api.post("/gesture", json={"enable": True, "loop": "random", "select": "diy", "ids": [1, 2]}).status_code == 200
     assert api.post("/gesture", json={"enable": False}).status_code == 200
-    assert described(api) == ["FACE 01 01 02 02 01 02", "FACE 00 00 00 00"]
+    assert described(api) == ["FACE 01 01 02 02 01 02", "FACE 00 00 00 00"]  # off: no reply awaited
     assert api.post("/gesture", json={"select": "diy", "ids": list(range(8))}).status_code == 422
 
 
@@ -167,12 +170,55 @@ def test_generic_upload(api):
 
 def test_link_errors_map_to_http():
     fake = FakeTransport(fail_connects=99)
-    with TestClient(create_app(Mask(fake, gap=0))) as c:
+    with TestClient(create_app(Mask(fake, gap=0, retry_wait=0))) as c:
         r = c.post("/brightness", json={"level": 5})
         assert r.status_code == 503 and "TransportError" in r.json()["detail"]
     fake = FakeTransport(error_on="PLAY")
     with TestClient(create_app(Mask(fake, gap=0))) as c:
         assert c.post("/diy/1/play").status_code == 502
+
+
+def test_diy_avoid_eyes_query_param(api):
+    r = api.post("/diy?avoid_eyes=true&margin=0", files={"file": ("a.png", png((255, 255, 255)), "image/png")})
+    assert r.status_code == 200, r.text
+    off = (10 * 58 + 17) * 3  # inside the image-left eye hole
+    assert api.fake.slots[1][off : off + 3] == b"\x00\x00\x00"
+    b = base64.b64encode(png((255, 255, 255))).decode()
+    r = api.post("/diy?avoid_eyes=true", json={"image_base64": b, "slot": 2, "avoid_eyes": False})
+    assert api.fake.slots[2][off : off + 3] == b"\xff\xff\xff"  # body wins over query
+    assert api.post("/diy?valign=middle", json={"image_base64": b}).status_code == 422
+
+
+def test_shows_endpoints(api):
+    s = api.get("/shows").json()
+    assert s["order"] == ["logo", "spiral", "session", "virgil"] and s["shows"]["virgil"]["slots"] == [11]
+    files = [("file", (f"{i}.png", png((0, 0, 50 * i)), "image/png")) for i in range(3)]
+    assert api.post("/shows/eyes", files=files, data={"start_slot": "5"}).status_code == 409  # overlap
+    r = api.post("/shows/eyes", files=files, data={"start_slot": "5", "dry_run": "true", "force": "true"})
+    assert r.json()["slots"] == [5, 6, 7] and r.json()["uploaded"] is False and 5 not in api.fake.slots
+    r = api.post("/shows/eyes?force=true&avoid_eyes=true", files=files, data={"start_slot": "5"})
+    assert r.status_code == 200, r.text
+    assert r.json()["dropped"] == ["spiral"] and api.fake.playing == [5, 6, 7]
+    r = api.post("/shows/blink", files={"file": ("a.gif", gif(4), "image/gif")}, data={"start_slot": "11", "force": "true"})
+    assert r.json()["slots"] == [11, 12, 13, 14]
+    assert api.post("/shows/logo/play").json() == {"ok": True, "show": "logo", "slots": [1]}
+    assert api.post("/shows/nope/play").status_code == 404
+    assert api.post("/next").json()["show"] == "eyes"
+    assert api.post("/next").json()["show"] == "blink"
+    assert api.get("/shows").json()["current"] == "blink"
+    r = api.put("/shows/order", json={"order": ["blink", "logo"]})
+    assert r.json()["order"] == ["blink", "logo", "eyes"]
+    assert api.post("/gesture/our-shows").json()["ids"] == [11, 1, 5]
+    assert described(api)[-1] == "FACE 01 00 02 03 0b 01 05"
+    assert api.post("/shows/bad name/play").status_code == 404
+    assert api.post("/shows/b@d", files=files).status_code == 422
+
+
+def test_panel_endpoint(api):
+    j = api.get("/panel?margin=2").json()
+    assert j["width"] == 46 and j["height"] == 58 and len(j["eyes"]) == 2 and j["margin"] == 2
+    assert len(j["rows"]) == 58 and j["rows"][17][10] == "E"
+    assert api.get("/panel?margin=9").status_code == 422
 
 
 def test_openapi(api):

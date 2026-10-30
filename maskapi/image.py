@@ -7,6 +7,7 @@ Full-panel DIY path: 46x58 RGB888, column-major (x=0 first, each column top->bot
 from __future__ import annotations
 
 import colorsys
+import glob
 import io
 import os
 from dataclasses import dataclass
@@ -202,7 +203,15 @@ def fit_panel(img: Image.Image, fit: str = "contain") -> Image.Image:
     return canvas
 
 
-def encode_panel(src: ImageSource, fit: str = "contain") -> Panel:
+def encode_panel(src: ImageSource, fit: str = "contain", avoid_eyes: bool = False, margin: int = 1,
+                 valign: str = "center", panel_map=None) -> Panel:
+    """46x58 Panel. avoid_eyes uses maskapi.panel.place (oval + eye holes kept dark)."""
+    if isinstance(src, Panel):
+        return src
+    if avoid_eyes:
+        from .panel import place
+
+        return Panel(place(src, fit, True, margin, valign, panel=panel_map))
     return Panel(fit_panel(load_image(src), fit))
 
 
@@ -214,4 +223,31 @@ def load_frames(src: ImageSource, max_frames: Optional[int] = None) -> list:
     if max_frames and len(frames) > max_frames:
         step = len(frames) / max_frames
         frames = [frames[int(i * step)] for i in range(max_frames)]
+    return frames
+
+
+def frame_sources(src) -> list:
+    """Expand a directory (its frame*.png, else *.png, sorted) into file paths; other
+    sources pass through. Generators write frameNN.png plus preview.gif/sheet.png."""
+    if isinstance(src, (str, os.PathLike)) and os.path.isdir(src):
+        files = sorted(glob.glob(os.path.join(src, "frame*.png"))) or sorted(glob.glob(os.path.join(src, "*.png")))
+        if not files:
+            raise ValueError(f"no frame*.png in {src}")
+        return files
+    return [src]
+
+
+def collect_frames(sources, max_frames: Optional[int] = None) -> list:
+    """Frames from a list of images / animated GIFs / frame directories (or one of them).
+    Panels pass through. Raises if more than max_frames."""
+    if not isinstance(sources, (list, tuple)):
+        sources = [sources]
+    frames = []
+    for s in sources:
+        for item in frame_sources(s):
+            frames += [item] if isinstance(item, Panel) else load_frames(item)
+    if not frames:
+        raise ValueError("no frames")
+    if max_frames and len(frames) > max_frames:
+        raise ValueError(f"{len(frames)} frames; at most {max_frames}")
     return frames
